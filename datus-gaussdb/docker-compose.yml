@@ -11,13 +11,11 @@
 #      not empty"). The wrapper creates /gausslog and hands it to omm.
 #   2. On Docker Desktop for macOS the FIRST gs_ctl start after initdb reliably
 #      aborts, while starting again on the same initialized data directory
-#      succeeds. The wrapper therefore retries the start after the image
-#      entrypoint exits non-zero. On Linux CI the entrypoint normally succeeds
-#      and the retry never runs, so it is harmless there.
+#      succeeds. The wrapper retries that temporary start in place so the
+#      image still runs all initialization scripts before its final start.
 #
-# The wrapper also creates the integration-test login role once the server is
-# up, since the abort happens before the image gets around to creating users.
-# It appends a sha256 pg_hba rule for that role; note the image's own catch-all
+# The synchronous init scripts configure TLS and create the test login role.
+# They append a sha256 pg_hba rule for that role; note the image's own catch-all
 # "host all all 0.0.0.0/0 md5" rule is matched first, which keeps the psycopg2
 # escape hatch (driver: psycopg2, md5 only) usable against this container.
 # Comment that catch-all out to exercise sha256 authentication exclusively.
@@ -49,6 +47,7 @@ services:
     volumes:
       - ./scripts/docker-entrypoint-wrapper.sh:/docker-entrypoint-wrapper.sh:ro
       - ./scripts/configure-test-tls.sh:/docker-entrypoint-initdb.d/10-configure-test-tls.sh:ro
+      - ./scripts/provision-test-user.sh:/docker-entrypoint-initdb.d/20-provision-test-user.sh:ro
       - gaussdb_tls:/gaussdb-tls:ro
     entrypoint: ["bash", "/docker-entrypoint-wrapper.sh"]
     healthcheck:

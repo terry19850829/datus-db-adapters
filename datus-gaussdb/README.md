@@ -232,6 +232,14 @@ documents two openGauss container quirks (the mandatory out-of-datadir
 `GAUSSLOG`, and the first post-initdb server start aborting on Docker Desktop
 for macOS) that its entrypoint wrapper works around.
 
+TLS configuration and test-user provisioning run synchronously in the image's
+initialization hooks. The wrapper retries only the temporary server start, so
+a failed SQL initialization cannot be bypassed by starting an unprovisioned
+server. The healthcheck requires completed provisioning and a TLS connection
+as the configured test user; it cannot accept the temporary initialization
+server. The completion marker lives in the data directory and survives a
+container restart.
+
 On macOS, integration tests use `pg8000` by default and also exercise the
 `psycopg2` escape hatch in the dedicated TLS contract. To exercise the official
 driver, run on Linux; `GAUSSDB_DRIVER=pg8000` selects the pure-Python path on

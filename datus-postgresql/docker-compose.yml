@@ -11,10 +11,9 @@ services:
     ports:
       - "${POSTGRESQL_HOST_PORT:-5432}:5432"
     healthcheck:
-      # A real query, not pg_isready: pg_isready reports "accepting
-      # connections" without authenticating, so a data volume left over from
-      # different credentials would come up healthy and fail only at test time.
-      test: ["CMD-SHELL", "psql -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" -c 'SELECT 1' >/dev/null 2>&1"]
+      # The init server accepts socket connections before setup finishes.
+      # Authenticate over TCP, which is enabled only for the final server.
+      test: ["CMD-SHELL", "PGPASSWORD=\"$${POSTGRES_PASSWORD}\" psql -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" -w -c 'SELECT 1' >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 5

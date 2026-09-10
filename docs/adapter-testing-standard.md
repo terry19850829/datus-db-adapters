@@ -300,6 +300,14 @@ An adapter returning `[]` for everything must fail these tests.
   that is gone.
 - Slow-starting engines (Doris-class) additionally ship `scripts/wait_for_<engine>.py` used by CI.
 
+For images that start a temporary database during initialization, readiness must
+reject that temporary instance. Use the final server's connection boundary
+(for example PostgreSQL TCP instead of its init-only socket, or ClickHouse's
+container network address instead of its init-only loopback listener). Run user
+and schema provisioning in the image's synchronous init hooks. Startup regressions
+must cover delayed initialization, a failed provisioning step, and restart with
+existing data; a successful `SELECT 1` during initialization is not sufficient.
+
 ### High-water-mark tests
 
 The best tests in the repo assert a real engine semantic and say why it's non-obvious in the

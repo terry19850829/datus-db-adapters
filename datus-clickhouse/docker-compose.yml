@@ -10,7 +10,9 @@ services:
       - CLICKHOUSE_PASSWORD=default_test
       - CLICKHOUSE_DB=default_test
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--user", "default_user", "--password", "default_test", "--query", "SELECT 1"]
+      # The init server binds only loopback. Use the container's network address
+      # and target database so initialization must finish before reporting healthy.
+      test: ["CMD-SHELL", "clickhouse-client --host \"$$(hostname)\" --user \"$${CLICKHOUSE_USER}\" --password \"$${CLICKHOUSE_PASSWORD}\" --database \"$${CLICKHOUSE_DB}\" --query 'SELECT 1'"]
       interval: 10s
       timeout: 5s
       retries: 10

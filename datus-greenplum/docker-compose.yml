@@ -11,8 +11,12 @@ services:
       TZ: UTC
       GREENPLUM_PASSWORD: pivotal
       GREENPLUM_DATABASE_NAME: test
+    volumes:
+      - ./scripts/mark-initialized.sh:/docker-entrypoint-initdb.d/99-datus-ready.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "su - gpadmin -c \"source /usr/local/greenplum-db/greenplum_path.sh && PGPASSWORD=pivotal psql -h localhost -p 5432 -U gpadmin -d test -c 'SELECT 1'\""]
+      # The first server already accepts local SQL before the image restarts it
+      # to load pg_hba.conf. Its init hooks run after that restart completes.
+      test: ["CMD-SHELL", "test -f \"$${GREENPLUM_DATA_DIRECTORY}/.datus-test-initialized\" && su - gpadmin -c \"source /usr/local/greenplum-db/greenplum_path.sh && PGPASSWORD=pivotal psql -h localhost -p 5432 -U gpadmin -d test -c 'SELECT 1'\""]
       interval: 10s
       timeout: 5s
       retries: 10

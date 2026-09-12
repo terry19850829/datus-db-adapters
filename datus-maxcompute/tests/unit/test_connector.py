@@ -530,7 +530,7 @@ def test_get_sample_rows_pins_max_partition(config):
 
     assert len(result) == 1
     execute_query.assert_called_once_with(
-        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260911' LIMIT 2",
+        "SELECT * FROM `project_a`.`default`.`orders` WHERE `pt`='20260911' LIMIT 2",
         result_format="pandas",
         database_name="project_a",
         schema_name="default",
@@ -548,7 +548,7 @@ def test_get_sample_rows_pins_every_partition_key(config):
         connector.get_sample_rows(top_n=2)
 
     execute_query.assert_called_once_with(
-        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260911' AND region='east' LIMIT 2",
+        "SELECT * FROM `project_a`.`default`.`orders` WHERE `pt`='20260911' AND `region`='east' LIMIT 2",
         result_format="pandas",
         database_name="project_a",
         schema_name="default",

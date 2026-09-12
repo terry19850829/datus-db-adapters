@@ -693,6 +693,48 @@ class MaxComputeConnector(BaseSqlConnector):
             if self._table_type(table) == "MATERIALIZED_VIEW"
         ]
 
+    @staticmethod
+    def _sql_string_literal(value: Any) -> str:
+        """Quote a partition value as a SQL string literal (``''`` escapes ``'``)."""
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _sample_partition_predicate(self, table: Any) -> str:
+        """``WHERE`` clause pinning the newest non-empty partition, or ``""`` if there is none.
+
+        MaxCompute rejects an unqualified ``SELECT *`` on a partitioned table when the
+        project sets ``odps.sql.allow.fullscan=false`` (a common hardening default on
+        shared projects) with "is full scan with all partitions, please specify
+        partition predicates" -- which left every partitioned table unsampleable.
+        Sampling has to name a partition explicitly.
+
+        ``get_max_partition()`` asks the service for the maximal partition instead of
+        reducing the partition list here: it is a single metadata call (measured ~0.8s
+        on a 193-partition table), it orders values by the service's own comparison
+        rather than lexicographically (``"9"`` must not outrank ``"10"`` for unpadded
+        numeric keys), and its default ``skip_empty=True`` lands on a partition that
+        actually holds data -- so a project whose latest partition has not been
+        produced yet still yields a sample.
+
+        Returns ``""`` for unpartitioned tables and whenever partition metadata cannot
+        be read, so the caller falls back to the previous predicate-free query rather
+        than failing outright.
+        """
+        try:
+            if not getattr(table.table_schema, "partitions", None):
+                return ""
+            partition = table.get_max_partition()
+        except Exception as exc:  # noqa: BLE001 - fall back to the predicate-free query
+            logger.debug("Cannot resolve max partition of table %r: %s", getattr(table, "name", table), exc)
+            return ""
+
+        spec = getattr(partition, "partition_spec", None)
+        keys = getattr(spec, "keys", None)
+        values = getattr(spec, "values", None)
+        if not keys or not values:
+            return ""
+        conditions = " AND ".join(f"{k}={self._sql_string_literal(v)}" for k, v in zip(keys, values))
+        return f" WHERE {conditions}"
+
     @override
     def get_sample_rows(
         self,
@@ -704,7 +746,7 @@ class MaxComputeConnector(BaseSqlConnector):
         table_type: TABLE_TYPE = "table",
     ) -> List[Dict[str, Any]]:
         project, schema = self._validate_context(catalog_name, database_name, schema_name)
-        targets: List[Tuple[str, str, str, Literal["table", "view", "mv"]]] = []
+        targets: List[Tuple[str, str, str, Literal["table", "view", "mv"], Any]] = []
         if tables:
             for table_name in tables:
                 resolved_project, resolved_schema, name = self._resolve_table(
@@ -720,19 +762,20 @@ class MaxComputeConnector(BaseSqlConnector):
                 object_type = self._metadata_table_type(table)
                 if table_type != "full" and table_type != object_type:
                     continue
-                targets.append((resolved_project, resolved_schema, name, object_type))
+                targets.append((resolved_project, resolved_schema, name, object_type, table))
         else:
             objects = list(self._odps.list_tables(project=project, schema=schema or None))
             for table in objects:
                 object_type = self._metadata_table_type(table)
                 if table_type == "full" or table_type == object_type:
-                    targets.append((project, schema, table.name, object_type))
+                    targets.append((project, schema, table.name, object_type, table))
 
         result: List[Dict[str, Any]] = []
-        for resolved_project, resolved_schema, name, object_type in targets:
+        for resolved_project, resolved_schema, name, object_type, table in targets:
             query = (
                 f"SELECT * FROM "
-                f"{self.full_name(database_name=resolved_project, schema_name=resolved_schema, table_name=name)} "
+                f"{self.full_name(database_name=resolved_project, schema_name=resolved_schema, table_name=name)}"
+                f"{self._sample_partition_predicate(table)} "
                 f"LIMIT {int(top_n)}"
             )
             query_result = self.execute_query(

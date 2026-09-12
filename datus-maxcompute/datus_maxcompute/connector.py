@@ -732,7 +732,9 @@ class MaxComputeConnector(BaseSqlConnector):
         values = getattr(spec, "values", None)
         if not keys or not values:
             return ""
-        conditions = " AND ".join(f"{k}={self._sql_string_literal(v)}" for k, v in zip(keys, values))
+        conditions = " AND ".join(
+            f"{self.quote_identifier(k)}={self._sql_string_literal(v)}" for k, v in zip(keys, values)
+        )
         return f" WHERE {conditions}"
 
     @override

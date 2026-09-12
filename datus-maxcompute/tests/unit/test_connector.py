@@ -508,20 +508,21 @@ def test_execute_routes_transaction_control_to_specific_rejection(config, sql):
     odps.run_sql.assert_not_called()
 
 
-def test_get_sample_rows_pins_latest_partition(config):
-    connector, odps = make_connector(config)
-    odps.list_tables.return_value = [
-        SimpleNamespace(
-            name="orders",
-            type=SimpleNamespace(value="MANAGED_TABLE"),
-            table_schema=SimpleNamespace(partitions=[SimpleNamespace(name="pt")]),
-            partitions=[
-                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260901"])),
-                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260910"])),
-                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260831"])),
-            ],
+def make_partitioned_table(name="orders", partitions=("pt",), values=("20260911",)):
+    """A listing object shaped like the one ``list_tables()`` returns."""
+    return SimpleNamespace(
+        name=name,
+        type=SimpleNamespace(value="MANAGED_TABLE"),
+        table_schema=SimpleNamespace(partitions=[SimpleNamespace(name=key) for key in partitions]),
+        get_max_partition=lambda: SimpleNamespace(
+            partition_spec=SimpleNamespace(keys=list(partitions), values=list(values))
         ),
-    ]
+    )
+
+
+def test_get_sample_rows_pins_max_partition(config):
+    connector, odps = make_connector(config)
+    odps.list_tables.return_value = [make_partitioned_table()]
     query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
 
     with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
@@ -529,7 +530,7 @@ def test_get_sample_rows_pins_latest_partition(config):
 
     assert len(result) == 1
     execute_query.assert_called_once_with(
-        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260910' LIMIT 2",
+        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260911' LIMIT 2",
         result_format="pandas",
         database_name="project_a",
         schema_name="default",
@@ -539,14 +540,7 @@ def test_get_sample_rows_pins_latest_partition(config):
 def test_get_sample_rows_pins_every_partition_key(config):
     connector, odps = make_connector(config)
     odps.list_tables.return_value = [
-        SimpleNamespace(
-            name="orders",
-            type=SimpleNamespace(value="MANAGED_TABLE"),
-            table_schema=SimpleNamespace(partitions=[SimpleNamespace(name="pt"), SimpleNamespace(name="region")]),
-            partitions=[
-                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt", "region"], values=["20260910", "east"])),
-            ],
-        ),
+        make_partitioned_table(partitions=("pt", "region"), values=("20260911", "east")),
     ]
     query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
 
@@ -554,7 +548,7 @@ def test_get_sample_rows_pins_every_partition_key(config):
         connector.get_sample_rows(top_n=2)
 
     execute_query.assert_called_once_with(
-        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260910' AND region='east' LIMIT 2",
+        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260911' AND region='east' LIMIT 2",
         result_format="pandas",
         database_name="project_a",
         schema_name="default",
@@ -585,10 +579,32 @@ def test_get_sample_rows_omits_predicate_for_unpartitioned_table(config):
 
 def test_get_sample_rows_falls_back_when_partition_metadata_is_missing(config):
     connector, odps = make_connector(config)
-    # Table objects without a table_schema stand in for metadata the driver cannot read.
+    # A table object without a table_schema stands in for metadata the driver cannot read.
     odps.list_tables.return_value = [
         SimpleNamespace(name="orders", type=SimpleNamespace(value="MANAGED_TABLE")),
     ]
+    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
+
+    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
+        connector.get_sample_rows(top_n=2)
+
+    execute_query.assert_called_once_with(
+        "SELECT * FROM `project_a`.`default`.`orders` LIMIT 2",
+        result_format="pandas",
+        database_name="project_a",
+        schema_name="default",
+    )
+
+
+def test_get_sample_rows_falls_back_when_max_partition_lookup_fails(config):
+    connector, odps = make_connector(config)
+    table = make_partitioned_table()
+
+    def boom():
+        raise RuntimeError("partition metadata unavailable")
+
+    table.get_max_partition = boom
+    odps.list_tables.return_value = [table]
     query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
 
     with patch.object(connector, "execute_query", return_value=query_result) as execute_query:

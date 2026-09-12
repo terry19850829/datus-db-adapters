@@ -506,3 +506,103 @@ def test_execute_routes_transaction_control_to_specific_rejection(config, sql):
     assert not result.success
     assert "does not support transactions" in result.error
     odps.run_sql.assert_not_called()
+
+
+def test_get_sample_rows_pins_latest_partition(config):
+    connector, odps = make_connector(config)
+    odps.list_tables.return_value = [
+        SimpleNamespace(
+            name="orders",
+            type=SimpleNamespace(value="MANAGED_TABLE"),
+            table_schema=SimpleNamespace(partitions=[SimpleNamespace(name="pt")]),
+            partitions=[
+                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260901"])),
+                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260910"])),
+                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260831"])),
+            ],
+        ),
+    ]
+    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
+
+    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
+        result = connector.get_sample_rows(top_n=2)
+
+    assert len(result) == 1
+    execute_query.assert_called_once_with(
+        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260910' LIMIT 2",
+        result_format="pandas",
+        database_name="project_a",
+        schema_name="default",
+    )
+
+
+def test_get_sample_rows_pins_every_partition_key(config):
+    connector, odps = make_connector(config)
+    odps.list_tables.return_value = [
+        SimpleNamespace(
+            name="orders",
+            type=SimpleNamespace(value="MANAGED_TABLE"),
+            table_schema=SimpleNamespace(partitions=[SimpleNamespace(name="pt"), SimpleNamespace(name="region")]),
+            partitions=[
+                SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt", "region"], values=["20260910", "east"])),
+            ],
+        ),
+    ]
+    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
+
+    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
+        connector.get_sample_rows(top_n=2)
+
+    execute_query.assert_called_once_with(
+        "SELECT * FROM `project_a`.`default`.`orders` WHERE pt='20260910' AND region='east' LIMIT 2",
+        result_format="pandas",
+        database_name="project_a",
+        schema_name="default",
+    )
+
+
+def test_get_sample_rows_omits_predicate_for_unpartitioned_table(config):
+    connector, odps = make_connector(config)
+    odps.list_tables.return_value = [
+        SimpleNamespace(
+            name="orders",
+            type=SimpleNamespace(value="MANAGED_TABLE"),
+            table_schema=SimpleNamespace(partitions=None),
+        ),
+    ]
+    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
+
+    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
+        connector.get_sample_rows(top_n=2)
+
+    execute_query.assert_called_once_with(
+        "SELECT * FROM `project_a`.`default`.`orders` LIMIT 2",
+        result_format="pandas",
+        database_name="project_a",
+        schema_name="default",
+    )
+
+
+def test_get_sample_rows_falls_back_when_partition_metadata_is_missing(config):
+    connector, odps = make_connector(config)
+    # Table objects without a table_schema stand in for metadata the driver cannot read.
+    odps.list_tables.return_value = [
+        SimpleNamespace(name="orders", type=SimpleNamespace(value="MANAGED_TABLE")),
+    ]
+    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
+
+    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
+        connector.get_sample_rows(top_n=2)
+
+    execute_query.assert_called_once_with(
+        "SELECT * FROM `project_a`.`default`.`orders` LIMIT 2",
+        result_format="pandas",
+        database_name="project_a",
+        schema_name="default",
+    )
+
+
+def test_sql_string_literal_escapes_single_quotes(config):
+    connector, _ = make_connector(config)
+
+    assert connector._sql_string_literal("a'b") == "'a''b'"

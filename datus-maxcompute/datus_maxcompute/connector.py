@@ -699,7 +699,7 @@ class MaxComputeConnector(BaseSqlConnector):
         return "'" + str(value).replace("'", "''") + "'"
 
     def _sample_partition_predicate(self, table: Any) -> str:
-        """``WHERE`` clause pinning the newest partition, or ``""`` if there is none to pin.
+        """``WHERE`` clause pinning the newest non-empty partition, or ``""`` if there is none.
 
         MaxCompute rejects an unqualified ``SELECT *`` on a partitioned table when the
         project sets ``odps.sql.allow.fullscan=false`` (a common hardening default on
@@ -707,10 +707,13 @@ class MaxComputeConnector(BaseSqlConnector):
         partition predicates" -- which left every partitioned table unsampleable.
         Sampling has to name a partition explicitly.
 
-        Listing partitions is a metadata call (measured ~0.3s for 193 partitions),
-        markedly cheaper than evaluating ``MAX(pt)`` as a job (~7s). Spec values are
-        compared lexicographically, which yields "newest last" for the conventional
-        ``yyyymmdd`` / ``yyyy-mm-dd`` string partition keys.
+        ``get_max_partition()`` asks the service for the maximal partition instead of
+        reducing the partition list here: it is a single metadata call (measured ~0.8s
+        on a 193-partition table), it orders values by the service's own comparison
+        rather than lexicographically (``"9"`` must not outrank ``"10"`` for unpadded
+        numeric keys), and its default ``skip_empty=True`` lands on a partition that
+        actually holds data -- so a project whose latest partition has not been
+        produced yet still yields a sample.
 
         Returns ``""`` for unpartitioned tables and whenever partition metadata cannot
         be read, so the caller falls back to the previous predicate-free query rather
@@ -719,22 +722,14 @@ class MaxComputeConnector(BaseSqlConnector):
         try:
             if not getattr(table.table_schema, "partitions", None):
                 return ""
-            partitions = list(table.partitions)
+            partition = table.get_max_partition()
         except Exception as exc:  # noqa: BLE001 - fall back to the predicate-free query
-            logger.debug("Cannot inspect partitions of table %r: %s", getattr(table, "name", table), exc)
+            logger.debug("Cannot resolve max partition of table %r: %s", getattr(table, "name", table), exc)
             return ""
 
-        latest_spec = None
-        latest_key: Optional[tuple] = None
-        for part in partitions:
-            spec = part.partition_spec
-            values = getattr(spec, "values", None)
-            key = tuple(str(v) for v in values) if values else (str(spec),)
-            if latest_key is None or key > latest_key:
-                latest_key, latest_spec = key, spec
-
-        keys = getattr(latest_spec, "keys", None) if latest_spec is not None else None
-        values = getattr(latest_spec, "values", None) if latest_spec is not None else None
+        spec = getattr(partition, "partition_spec", None)
+        keys = getattr(spec, "keys", None)
+        values = getattr(spec, "values", None)
         if not keys or not values:
             return ""
         conditions = " AND ".join(f"{k}={self._sql_string_literal(v)}" for k, v in zip(keys, values))

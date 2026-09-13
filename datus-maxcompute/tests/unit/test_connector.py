@@ -595,30 +595,73 @@ def test_get_sample_rows_falls_back_when_partition_metadata_is_missing(config):
         schema_name="default",
     )
 
-
-def test_get_sample_rows_falls_back_when_max_partition_lookup_fails(config):
-    connector, odps = make_connector(config)
-    table = make_partitioned_table()
-
-    def boom():
-        raise RuntimeError("partition metadata unavailable")
-
-    table.get_max_partition = boom
-    odps.list_tables.return_value = [table]
-    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
-
-    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
-        connector.get_sample_rows(top_n=2)
-
-    execute_query.assert_called_once_with(
-        "SELECT * FROM `project_a`.`default`.`orders` LIMIT 2",
-        result_format="pandas",
-        database_name="project_a",
-        schema_name="default",
-    )
-
-
 def test_sql_string_literal_escapes_single_quotes(config):
     connector, _ = make_connector(config)
 
     assert connector._sql_string_literal("a'b") == "'a''b'"
+
+
+def test_sample_partition_predicate_retries_without_skip_empty(config):
+    """外部表不报 physical_size，pyodps 的 skip_empty 排序会抛 TypeError。
+
+    OSS / Hologres FDW 外表的分区 ``physical_size`` 为 None，
+    ``get_max_partition()`` 内部的 ``part.physical_size > 0`` 直接 TypeError。
+    断言此时退一步用 ``skip_empty=False`` 仍能拿到分区。
+    """
+    connector, _ = make_connector(config)
+    table = make_partitioned_table()
+    calls = []
+
+    def get_max_partition(**kwargs):
+        calls.append(kwargs)
+        if not kwargs:
+            raise TypeError("'>' not supported between instances of 'NoneType' and 'int'")
+        return SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260911"]))
+
+    table.get_max_partition = get_max_partition
+
+    assert connector._sample_partition_predicate(table) == " WHERE `pt`='20260911'"
+    assert calls == [{}, {"skip_empty": False}]
+
+
+def test_sample_partition_predicate_returns_none_when_partition_unresolvable(config):
+    """分区表但两种取法都失败 → 返回 None，而不是退回无谓词查询。"""
+    connector, _ = make_connector(config)
+    table = make_partitioned_table()
+
+    def boom(**kwargs):
+        raise ODPSError("partition metadata unavailable")
+
+    table.get_max_partition = boom
+
+    assert connector._sample_partition_predicate(table) is None
+
+
+def test_get_sample_rows_skips_partitioned_table_without_predicate(config):
+    """无法解析分区的分区表不应发起查询。
+
+    分区表上的无谓词 ``SELECT *`` 在 ``odps.sql.allow.fullscan=false`` 下必被
+    ODPS-0130071 拒绝，照发只会白烧一个作业并打整段 traceback。
+    """
+    connector, odps = make_connector(config)
+    table = make_partitioned_table()
+
+    def boom(**kwargs):
+        raise ODPSError("partition metadata unavailable")
+
+    table.get_max_partition = boom
+    odps.list_tables.return_value = [table]
+
+    with patch.object(connector, "execute_query") as execute_query:
+        result = connector.get_sample_rows(top_n=2)
+
+    assert result == []
+    execute_query.assert_not_called()
+
+
+def test_sample_partition_predicate_quotes_reserved_partition_key(config):
+    """分区键可能是保留字，必须加反引号。"""
+    connector, _ = make_connector(config)
+    table = make_partitioned_table(partitions=("select",), values=("20260911",))
+
+    assert connector._sample_partition_predicate(table) == " WHERE `select`='20260911'"

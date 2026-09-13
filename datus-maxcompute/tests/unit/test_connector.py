@@ -13,7 +13,12 @@ from pydantic import BaseModel
 
 from datus_db_core import DatusDbException
 from datus_maxcompute import MaxComputeConfig, MaxComputeConnector
-from datus_maxcompute.connector import _coerce_config, _declares_partitions, _TimeoutRestClient
+from datus_maxcompute.connector import (
+    _coerce_config,
+    _declares_partitions,
+    _matches_ignore_patterns,
+    _TimeoutRestClient,
+)
 
 
 @pytest.fixture
@@ -376,6 +381,122 @@ def test_get_tables_with_ddl_rejects_table_from_another_schema(config):
             schema_name="analytics",
             tables=["project_a.default.orders"],
         )
+
+
+def make_listed_table(name, table_type="MANAGED_TABLE"):
+    """构造 ``odps.list_tables()`` 返回的对象。"""
+    table = MagicMock()
+    table.name = name
+    table.type = SimpleNamespace(value=table_type)
+    table.get_ddl.return_value = f"CREATE TABLE {name} (id BIGINT)"
+    return table
+
+
+@pytest.fixture
+def ignored_config(config):
+    """模拟用户在 agent.yml 里写 ``ignore_table_patterns: ["tmp_*"]``。"""
+    return config.model_copy(update={"ignore_table_patterns": ["tmp_*"]})
+
+
+def test_ignore_patterns_are_empty_by_default(config):
+    """默认不过滤：忽略哪些表由用户配置，不是适配器的内置假设。"""
+    assert config.ignore_table_patterns == []
+
+
+@pytest.mark.parametrize(
+    ("name", "patterns", "expected"),
+    [
+        ("tmp_0826", ["tmp_*"], True),
+        ("tmp_26061ecd_89f6_4010_88bd_4ea6d95abc22", ["tmp_*"], True),
+        ("TMP_0826", ["tmp_*"], True),  # 大小写不敏感
+        ("orders_bak", ["*_bak"], True),  # 后缀规则
+        ("orders", ["tmp_*"], False),
+        ("temp_orders", ["tmp_*"], False),  # 不误伤 temp_ 前缀
+        ("tmp_0826", [], False),  # 空列表 = 不过滤
+        ("tmp_0826", None, False),
+    ],
+)
+def test_matches_ignore_patterns(name, patterns, expected):
+    assert _matches_ignore_patterns(name, patterns) is expected
+
+
+def test_get_tables_with_ddl_skips_ignored_tables(ignored_config):
+    """被忽略的表连 DDL 都不取。
+
+    生产项目里作业会创建/删除 tmp_ 表；列举到 fetch 之间表消失会让 get_ddl() 抛
+    NoSuchObject，而列表推导会让它连带整个 datasource 的 schema init 一起失败。
+    不发起这次读取，既消除了失败面，也省掉了那部分耗时。
+    """
+    connector, odps = make_connector(ignored_config)
+    scratch = make_listed_table("tmp_26061ecd_89f6_4010_88bd_4ea6d95abc22")
+    orders = make_listed_table("orders")
+    odps.list_tables.return_value = [scratch, orders]
+
+    result = connector.get_tables_with_ddl(database_name="project_a", schema_name="default")
+
+    assert [entry["table_name"] for entry in result] == ["orders"]
+    scratch.get_ddl.assert_not_called()
+
+
+def test_get_views_with_ddl_skips_ignored_tables(ignored_config):
+    """视图路径同样过滤。"""
+    connector, odps = make_connector(ignored_config)
+    scratch = make_listed_table("tmp_0826", "VIRTUAL_VIEW")
+    view = make_listed_table("orders_view", "VIRTUAL_VIEW")
+    odps.list_tables.return_value = [scratch, view]
+
+    result = connector.get_views_with_ddl(database_name="project_a", schema_name="default")
+
+    assert [entry["table_name"] for entry in result] == ["orders_view"]
+    scratch.get_ddl.assert_not_called()
+
+
+def test_get_materialized_views_with_ddl_skips_ignored_tables(ignored_config):
+    """物化视图路径同样过滤 —— 三处列举共用同一层。"""
+    connector, odps = make_connector(ignored_config)
+    scratch = make_listed_table("tmp_0826", "MATERIALIZED_VIEW")
+    materialized = make_listed_table("orders_mv", "MATERIALIZED_VIEW")
+    odps.list_tables.return_value = [scratch, materialized]
+
+    result = connector.get_materialized_views_with_ddl(database_name="project_a", schema_name="default")
+
+    assert [entry["table_name"] for entry in result] == ["orders_mv"]
+    scratch.get_ddl.assert_not_called()
+
+
+def test_name_only_listing_skips_ignored_tables(ignored_config):
+    """名单接口与 DDL 路径共用同一处过滤，结果必须一致。"""
+    connector, odps = make_connector(ignored_config)
+    odps.list_tables.return_value = [make_listed_table("tmp_0826"), make_listed_table("orders")]
+
+    assert connector.get_tables(database_name="project_a", schema_name="default") == ["orders"]
+
+
+def test_ignore_patterns_accept_multiple_globs(config):
+    """规则是列表，可以同时给多条。"""
+    connector, odps = make_connector(config.model_copy(update={"ignore_table_patterns": ["tmp_*", "*_bak"]}))
+    odps.list_tables.return_value = [
+        make_listed_table("tmp_0826"),
+        make_listed_table("orders_bak"),
+        make_listed_table("orders"),
+    ]
+
+    result = connector.get_tables_with_ddl(database_name="project_a", schema_name="default")
+
+    assert [entry["table_name"] for entry in result] == ["orders"]
+
+
+def test_tables_are_all_listed_when_no_pattern_configured(config):
+    """没配规则时一张都不少，且照常取 DDL —— 确认过滤是 opt-in。"""
+    connector, odps = make_connector(config)
+    scratch = make_listed_table("tmp_0826")
+    orders = make_listed_table("orders")
+    odps.list_tables.return_value = [scratch, orders]
+
+    result = connector.get_tables_with_ddl(database_name="project_a", schema_name="default")
+
+    assert sorted(entry["table_name"] for entry in result) == ["orders", "tmp_0826"]
+    scratch.get_ddl.assert_called_once()
 
 
 def test_get_sample_rows_routes_implicit_view_requests(config):

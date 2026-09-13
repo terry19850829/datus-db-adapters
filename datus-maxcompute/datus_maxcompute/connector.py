@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import itertools
+import fnmatch
 import re
-from typing import Any, Dict, Iterator, List, Literal, Optional, Set, Tuple, Union, override
+from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Set, Tuple, Union, override
 
 import pandas as pd
 import pyarrow as pa
@@ -115,7 +115,25 @@ def _coerce_config(config: Union[MaxComputeConfig, Dict[str, Any], BaseModel]) -
         timeout_seconds=get("timeout_seconds", default=30),
         query_timeout_seconds=get("query_timeout_seconds", default=600),
         default_hints=get("default_hints", default={}),
+        ignore_table_patterns=get("ignore_table_patterns", default=[]),
     )
+
+
+def _matches_ignore_patterns(name: str, patterns: Sequence[str]) -> bool:
+    """Whether *name* matches any entry of the ``ignore_table_patterns`` config.
+
+    Patterns are globs (``fnmatch``), so a user can write ``tmp_*``, ``*_bak`` or
+    ``tmp_2020*`` in ``agent.yml``. Matching is case-insensitive: MaxCompute object
+    names are, and a pattern must not depend on the spelling the server returns.
+
+    An empty pattern list -- the default -- disables filtering entirely. Nothing is
+    ignored unless the user asks for it, so this adapter carries no assumption about
+    which tables of a given project matter.
+    """
+    if not patterns:
+        return False
+    lowered = name.lower()
+    return any(fnmatch.fnmatchcase(lowered, str(pattern).lower()) for pattern in patterns)
 
 
 def _declares_partitions(table: Any) -> bool:
@@ -128,30 +146,6 @@ def _declares_partitions(table: Any) -> bool:
     try:
         return bool(getattr(table.table_schema, "partitions", None))
     except Exception:  # noqa: BLE001 - unreadable schema: assume no partitions
-        return False
-
-
-# How many partitions to look at when picking a sample target. Partition listing is
-# paged (100 per request), so this stays inside a single page: scanning it is free,
-# while reading further pages costs one round-trip each.
-_PARTITION_SCAN_LIMIT = 100
-
-
-def _partition_has_data(partition: Any) -> bool:
-    """Whether *partition* already holds data.
-
-    ``physical_size`` comes straight out of the partition-listing JSON (pyodps parses
-    it with a ``JSONNodeField``), so reading it costs no extra request. External tables
-    -- OSS, Hologres FDW and friends -- do not report a physical size and yield
-    ``None``; that is "unknown", not "empty", so it is reported as ``False`` and the
-    caller keeps whatever candidate it has already seen.
-    """
-    size = getattr(partition, "physical_size", None)
-    if size is None:
-        return False
-    try:
-        return int(size) > 0
-    except (TypeError, ValueError):
         return False
 
 
@@ -553,6 +547,15 @@ class MaxComputeConnector(BaseSqlConnector):
     ) -> Tuple[str, str, List[Any]]:
         project, schema = self._validate_context(catalog_name, database_name, schema_name)
         objects = list(self._odps.list_tables(project=project, schema=schema or None))
+        # Apply the ignore list *before* any DDL is fetched. Listing and the per-table
+        # metadata read are separate calls, so a table a concurrent job drops in between
+        # raises NoSuchObject from ``table.get_ddl()``. Inside a list comprehension that
+        # aborts every remaining table of the datasource, throwing away metadata already
+        # paid for. Filtering here also skips those reads altogether, and covers tables,
+        # views and materialized views in one place.
+        patterns = self.config.ignore_table_patterns
+        if patterns:
+            objects = [obj for obj in objects if not _matches_ignore_patterns(obj.name, patterns)]
         return project, schema, objects
 
     @staticmethod
@@ -739,48 +742,30 @@ class MaxComputeConnector(BaseSqlConnector):
     def _max_partition(self, table: Any) -> Any:
         """Newest partition of *table*, or ``None`` when none can be resolved.
 
-        Reads **one page** of ``iterate_partitions(reverse=True)`` and keeps the best
-        candidate found in it. The service returns partitions in its own reverse order,
-        so the first entry is already the maximal one -- and unpadded numeric keys
-        (``"10"`` before ``"9"``) are ranked by the service rather than by a string
-        comparison here.
+        Asks the service for the maximal partition instead of reducing
+        ``table.partitions`` here: the service compares values with its own ordering, so
+        an unpadded numeric key such as ``"9"`` does not outrank ``"10"``, and the whole
+        partition list is never fetched.
 
-        Within that page the first partition that holds data wins; ``physical_size`` is
-        read from the listing payload, not fetched per partition (see
-        ``_partition_has_data``), so scanning the page costs nothing extra. When
-        nothing on the page holds data -- or the table is external and reports no size
-        at all -- the newest partition is returned anyway: an empty partition answers a
+        The second attempt drops ``skip_empty``. Its ranking is ``part.physical_size > 0``,
+        and external tables -- OSS, Hologres FDW and friends -- report no physical size
+        at all, so that comparison raises ``TypeError``. Falling back to an unranked max
+        still pins a partition: one that has not been produced yet answers a
         predicate-pinned query with zero rows, which is a valid sample result.
-
-        Why not ``table.get_max_partition()``: it materialises *every* partition of the
-        table and sorts them in Python (pyodps ``models/partitions.py``)::
-
-            part_values = [
-                (part, tuple(part.partition_spec.values()))
-                for part in self.iterate_partitions(spec)
-            ]
-
-        A 1042-partition table therefore costs ten paged round-trips instead of one
-        (measured 1.0s vs 0.45s for the same partition), and an external table raises
-        ``TypeError`` outright from its ``skip_empty`` ranking, which does
-        ``part.physical_size > 0`` on a ``None``. Fewer requests also means fewer
-        chances to land on a stalled network hop.
 
         Returns ``None`` when no partition can be resolved; the caller skips the table
         rather than falling back to a query that is guaranteed to be rejected.
         """
-        try:
-            candidates = itertools.islice(table.iterate_partitions(reverse=True), _PARTITION_SCAN_LIMIT)
-            newest: Any = None
-            for partition in candidates:
-                if newest is None:
-                    newest = partition
-                if _partition_has_data(partition):
-                    return partition
-            return newest
-        except Exception as exc:  # noqa: BLE001 - the caller skips this table instead
-            logger.debug("Cannot iterate partitions of table %r: %s", getattr(table, "name", table), exc)
-            return None
+        for kwargs in ({}, {"skip_empty": False}):
+            try:
+                return table.get_max_partition(**kwargs)
+            except TypeError:
+                # The unranked retry below is the reason this is caught here.
+                continue
+            except Exception as exc:  # noqa: BLE001 - the caller skips this table instead
+                logger.debug("Cannot resolve newest partition of table %r: %s", getattr(table, "name", table), exc)
+                return None
+        return None
 
     def _sample_partition_predicate(self, table: Any) -> Optional[str]:
         """``WHERE`` clause pinning the newest partition, or ``""`` when none is needed.
@@ -791,12 +776,12 @@ class MaxComputeConnector(BaseSqlConnector):
         partition predicates" -- which left every partitioned table unsampleable.
         Sampling has to name a partition explicitly.
 
-        The partition comes from ``_max_partition``, which asks the service for one page
-        of partitions in reverse order. That keeps the service's own value ordering (so
-        an unpadded numeric key such as ``"9"`` does not outrank ``"10"``) and prefers a
-        partition that actually holds data, so a project whose latest partition has not
-        been produced yet still yields a sample. Partition keys are quoted, since
-        MaxCompute allows reserved words as partition-column names.
+        The partition comes from ``_max_partition``, which asks the service for the
+        maximal one. That keeps the service's own value ordering (so an unpadded numeric
+        key such as ``"9"`` does not outrank ``"10"``) and prefers a partition that
+        already holds data, so a project whose latest partition has not been produced yet
+        still yields a sample. Partition keys are quoted, since MaxCompute allows
+        reserved words as partition-column names.
 
         Returns:
             ``""`` for unpartitioned tables -- no predicate required.

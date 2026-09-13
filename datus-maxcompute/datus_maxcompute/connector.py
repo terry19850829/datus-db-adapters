@@ -117,6 +117,19 @@ def _coerce_config(config: Union[MaxComputeConfig, Dict[str, Any], BaseModel]) -
     )
 
 
+def _declares_partitions(table: Any) -> bool:
+    """Whether *table* declares partition columns.
+
+    Wrapped in a helper because the metadata read itself can fail on odd table
+    types; a table whose schema cannot be inspected is treated as unpartitioned,
+    which keeps the caller on the predicate-free path it has always used.
+    """
+    try:
+        return bool(getattr(table.table_schema, "partitions", None))
+    except Exception:  # noqa: BLE001 - unreadable schema: assume no partitions
+        return False
+
+
 class MaxComputeConnector(BaseSqlConnector):
     """MaxCompute connector backed by the official PyODPS SDK."""
 
@@ -698,8 +711,38 @@ class MaxComputeConnector(BaseSqlConnector):
         """Quote a partition value as a SQL string literal (``''`` escapes ``'``)."""
         return "'" + str(value).replace("'", "''") + "'"
 
-    def _sample_partition_predicate(self, table: Any) -> str:
-        """``WHERE`` clause pinning the newest non-empty partition, or ``""`` if there is none.
+    def _max_partition(self, table: Any) -> Any:
+        """Newest partition of *table*, or ``None`` when none can be resolved.
+
+        ``get_max_partition()`` defaults to ``skip_empty=True``, which ranks candidate
+        partitions by ``part.physical_size``. External tables -- OSS, Hologres FDW and
+        friends -- do not report a physical size, so that attribute is ``None`` and
+        pyodps raises ``TypeError: '>' not supported between instances of 'NoneType'
+        and 'int'`` before returning anything. For those tables the "skip empty"
+        refinement is simply unavailable, so retry without it: an empty partition still
+        answers a predicate-pinned query with zero rows, which is a valid sample result.
+
+        Being unable to rank partitions must not degrade into a predicate-free query --
+        on a partitioned table that statement is rejected outright (see
+        ``_sample_partition_predicate``), so ``None`` is propagated to the caller.
+        """
+        try:
+            return table.get_max_partition()
+        except Exception as exc:  # noqa: BLE001 - rank-based selection is best-effort
+            logger.debug(
+                "get_max_partition(skip_empty=True) unusable for table %r: %s; retrying without skip_empty",
+                getattr(table, "name", table),
+                exc,
+            )
+
+        try:
+            return table.get_max_partition(skip_empty=False)
+        except Exception as exc:  # noqa: BLE001 - caller skips the table instead
+            logger.debug("Cannot resolve max partition of table %r: %s", getattr(table, "name", table), exc)
+            return None
+
+    def _sample_partition_predicate(self, table: Any) -> Optional[str]:
+        """``WHERE`` clause pinning the newest partition, or ``""`` when none is needed.
 
         MaxCompute rejects an unqualified ``SELECT *`` on a partitioned table when the
         project sets ``odps.sql.allow.fullscan=false`` (a common hardening default on
@@ -713,25 +756,27 @@ class MaxComputeConnector(BaseSqlConnector):
         rather than lexicographically (``"9"`` must not outrank ``"10"`` for unpadded
         numeric keys), and its default ``skip_empty=True`` lands on a partition that
         actually holds data -- so a project whose latest partition has not been
-        produced yet still yields a sample.
+        produced yet still yields a sample. See ``_max_partition`` for the external-table
+        fallback.
 
-        Returns ``""`` for unpartitioned tables and whenever partition metadata cannot
-        be read, so the caller falls back to the previous predicate-free query rather
-        than failing outright.
+        Returns:
+            ``""`` for unpartitioned tables -- no predicate required.
+            ``" WHERE ..."`` when a partition could be pinned.
+            ``None`` when the table *is* partitioned but no partition could be
+            resolved. The caller must skip such a table: an unqualified ``SELECT *``
+            is guaranteed to be rejected, so running it only burns a job and logs a
+            traceback for a failure that is already known.
         """
-        try:
-            if not getattr(table.table_schema, "partitions", None):
-                return ""
-            partition = table.get_max_partition()
-        except Exception as exc:  # noqa: BLE001 - fall back to the predicate-free query
-            logger.debug("Cannot resolve max partition of table %r: %s", getattr(table, "name", table), exc)
+        if not _declares_partitions(table):
             return ""
 
+        partition = self._max_partition(table)
         spec = getattr(partition, "partition_spec", None)
         keys = getattr(spec, "keys", None)
         values = getattr(spec, "values", None)
         if not keys or not values:
-            return ""
+            return None
+
         conditions = " AND ".join(
             f"{self.quote_identifier(k)}={self._sql_string_literal(v)}" for k, v in zip(keys, values)
         )
@@ -774,10 +819,21 @@ class MaxComputeConnector(BaseSqlConnector):
 
         result: List[Dict[str, Any]] = []
         for resolved_project, resolved_schema, name, object_type, table in targets:
+            predicate = self._sample_partition_predicate(table)
+            if predicate is None:
+                # Partitioned table whose partition metadata could not be resolved.
+                # An unqualified ``SELECT *`` would be rejected with ODPS-0130071, so
+                # issuing it would only burn a job and log a traceback for a failure
+                # that is already known. Skip the sample and keep the schema.
+                logger.warning(
+                    "Skipping sample of partitioned table %s: no partition predicate could be resolved", name
+                )
+                continue
+
             query = (
                 f"SELECT * FROM "
                 f"{self.full_name(database_name=resolved_project, schema_name=resolved_schema, table_name=name)}"
-                f"{self._sample_partition_predicate(table)} "
+                f"{predicate} "
                 f"LIMIT {int(top_n)}"
             )
             query_result = self.execute_query(

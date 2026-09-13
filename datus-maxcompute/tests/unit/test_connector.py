@@ -17,6 +17,7 @@ from datus_maxcompute.connector import (
     _coerce_config,
     _declares_partitions,
     _matches_ignore_patterns,
+    _PARTITION_SCAN_LIMIT,
     _TimeoutRestClient,
 )
 
@@ -629,15 +630,28 @@ def test_execute_routes_transaction_control_to_specific_rejection(config, sql):
     odps.run_sql.assert_not_called()
 
 
-def make_partitioned_table(name="orders", partitions=("pt",), values=("20260911",)):
-    """A listing object shaped like the one ``list_tables()`` returns."""
+def make_listed_partition(keys, values, physical_size=100):
+    """A partition as ``iterate_partitions()`` yields it."""
+    return SimpleNamespace(
+        partition_spec=SimpleNamespace(keys=list(keys), values=list(values)),
+        physical_size=physical_size,
+    )
+
+
+def make_partitioned_table(name="orders", partitions=("pt",), values=("20260911",), listed=None):
+    """A listing object shaped like the one ``list_tables()`` returns.
+
+    ``iterate_partitions(reverse=True)`` is served from ``listed`` -- newest first, the
+    order the service returns -- defaulting to one partition that holds data. It stays a
+    plain iterator so a test can hand it a long list and observe how much is consumed.
+    """
+    if listed is None:
+        listed = [make_listed_partition(partitions, values)]
     return SimpleNamespace(
         name=name,
         type=SimpleNamespace(value="MANAGED_TABLE"),
         table_schema=SimpleNamespace(partitions=[SimpleNamespace(name=key) for key in partitions]),
-        get_max_partition=lambda: SimpleNamespace(
-            partition_spec=SimpleNamespace(keys=list(partitions), values=list(values))
-        ),
+        iterate_partitions=lambda **kwargs: iter(list(listed)),
     )
 
 
@@ -723,38 +737,68 @@ def test_sql_string_literal_escapes_single_quotes(config):
     assert connector._sql_string_literal("a'b") == "'a''b'"
 
 
-def test_sample_partition_predicate_retries_without_skip_empty(config):
-    """外部表不报 physical_size，pyodps 的 skip_empty 排序会抛 TypeError。
-
-    OSS / Hologres FDW 外表的分区 ``physical_size`` 为 None，
-    ``get_max_partition()`` 内部的 ``part.physical_size > 0`` 直接 TypeError。
-    断言此时退一步用 ``skip_empty=False`` 仍能拿到分区。
-    """
+def test_sample_partition_predicate_prefers_partition_with_data(config):
+    """最新分区可能还没产出，一页之内优先挑有数据的那个。"""
     connector, _ = make_connector(config)
-    table = make_partitioned_table()
-    calls = []
-
-    def get_max_partition(**kwargs):
-        calls.append(kwargs)
-        if not kwargs:
-            raise TypeError("'>' not supported between instances of 'NoneType' and 'int'")
-        return SimpleNamespace(partition_spec=SimpleNamespace(keys=["pt"], values=["20260911"]))
-
-    table.get_max_partition = get_max_partition
+    table = make_partitioned_table(
+        listed=[
+            make_listed_partition(["pt"], ["20260912"], physical_size=0),
+            make_listed_partition(["pt"], ["20260911"], physical_size=1024),
+        ]
+    )
 
     assert connector._sample_partition_predicate(table) == " WHERE `pt`='20260911'"
-    assert calls == [{}, {"skip_empty": False}]
+
+
+def test_sample_partition_predicate_falls_back_to_newest_when_page_is_empty(config):
+    """整页都没有数据（或外表不报 physical_size）时，仍用最新的那个。
+
+    空分区回答带谓词的查询会返回零行，那也是一个合法的采样结果。
+    """
+    connector, _ = make_connector(config)
+    table = make_partitioned_table(
+        listed=[
+            make_listed_partition(["pt"], ["20260912"], physical_size=None),
+            make_listed_partition(["pt"], ["20260911"], physical_size=None),
+        ]
+    )
+
+    assert connector._sample_partition_predicate(table) == " WHERE `pt`='20260912'"
+
+
+def test_sample_partition_predicate_reads_one_page_only(config):
+    """不物化整张分区表：最多消费一页。
+
+    这正是选 ``iterate_partitions`` 而不是 ``get_max_partition()`` 的原因 ——
+    后者会把每个分区都拉下来再在 Python 里排序。
+    """
+    connector, _ = make_connector(config)
+    consumed = []
+
+    def iterate_partitions(**kwargs):
+        def partitions():
+            for index in range(1000):
+                consumed.append(index)
+                yield make_listed_partition(["pt"], [f"pt_{index:04d}"], physical_size=0)
+
+        return partitions()
+
+    table = make_partitioned_table()
+    table.iterate_partitions = iterate_partitions
+
+    assert connector._sample_partition_predicate(table) == " WHERE `pt`='pt_0000'"
+    assert len(consumed) == _PARTITION_SCAN_LIMIT
 
 
 def test_sample_partition_predicate_returns_none_when_partition_unresolvable(config):
-    """分区表但两种取法都失败 → 返回 None，而不是退回无谓词查询。"""
+    """分区表但分区读不出来 → 返回 None，而不是退回无谓词查询。"""
     connector, _ = make_connector(config)
     table = make_partitioned_table()
 
     def boom(**kwargs):
         raise ODPSError("partition metadata unavailable")
 
-    table.get_max_partition = boom
+    table.iterate_partitions = boom
 
     assert connector._sample_partition_predicate(table) is None
 
@@ -771,7 +815,7 @@ def test_get_sample_rows_skips_partitioned_table_without_predicate(config):
     def boom(**kwargs):
         raise ODPSError("partition metadata unavailable")
 
-    table.get_max_partition = boom
+    table.iterate_partitions = boom
     odps.list_tables.return_value = [table]
 
     with patch.object(connector, "execute_query") as execute_query:

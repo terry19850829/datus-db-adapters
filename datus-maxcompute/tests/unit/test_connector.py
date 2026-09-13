@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from datus_db_core import DatusDbException
 from datus_maxcompute import MaxComputeConfig, MaxComputeConnector
-from datus_maxcompute.connector import _coerce_config, _TimeoutRestClient
+from datus_maxcompute.connector import _coerce_config, _declares_partitions, _TimeoutRestClient
 
 
 @pytest.fixture
@@ -595,6 +595,7 @@ def test_get_sample_rows_falls_back_when_partition_metadata_is_missing(config):
         schema_name="default",
     )
 
+
 def test_sql_string_literal_escapes_single_quotes(config):
     connector, _ = make_connector(config)
 
@@ -665,3 +666,10 @@ def test_sample_partition_predicate_quotes_reserved_partition_key(config):
     table = make_partitioned_table(partitions=("select",), values=("20260911",))
 
     assert connector._sample_partition_predicate(table) == " WHERE `select`='20260911'"
+
+
+def test_declares_partitions_treats_unreadable_schema_as_unpartitioned():
+    """schema 读失败的表按非分区表处理，退回既有的无谓词路径。"""
+    table_without_schema = SimpleNamespace()
+
+    assert _declares_partitions(table_without_schema) is False

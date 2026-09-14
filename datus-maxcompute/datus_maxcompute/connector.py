@@ -31,10 +31,12 @@ try:
     from odps import ODPS
     from odps.errors import ODPSError, WaitTimeoutError
     from odps.rest import RestClient
+    from odps.utils import escape_odps_string
 except ImportError as exc:  # pragma: no cover - protected by package dependency
     ODPS = None  # type: ignore[assignment]
     RestClient = object  # type: ignore[assignment,misc]
     ODPSError = WaitTimeoutError = Exception  # type: ignore[misc,assignment]
+    escape_odps_string = None  # type: ignore[assignment]
     _PYODPS_IMPORT_ERROR: Optional[Exception] = exc
 else:
     _PYODPS_IMPORT_ERROR = None
@@ -763,8 +765,14 @@ class MaxComputeConnector(BaseSqlConnector):
 
     @staticmethod
     def _sql_string_literal(value: Any) -> str:
-        """Quote a partition value as a SQL string literal (``''`` escapes ``'``)."""
-        return "'" + str(value).replace("'", "''") + "'"
+        """Quote a partition value as a MaxCompute SQL string literal.
+
+        Goes through pyodps' own escaping rather than doubling quotes by hand: ODPS
+        reads backslash sequences (``\\n``, ``\\t``, ``\\b``) as escapes, so a value
+        carrying a backslash would otherwise pin a different partition and quietly
+        return no rows.
+        """
+        return "'" + escape_odps_string(str(value)) + "'"
 
     def _max_partition(self, table: Any) -> Any:
         """Newest partition of *table*, or ``None`` when none can be resolved.

@@ -741,10 +741,16 @@ def test_get_sample_rows_skips_table_with_unreadable_metadata(config):
     execute_query.assert_not_called()
 
 
-def test_sql_string_literal_escapes_single_quotes(config):
+def test_sql_string_literal_escapes_quotes_and_backslashes(config):
+    """分区值走 pyodps 的转义：引号和反斜杠都要处理。
+
+    只把引号加倍是不够的 -- ODPS 把 ``\\b``、``\\n`` 这类反斜杠序列当转义，
+    含反斜杠的分区值会让谓词落到别的分区，静默返回零行。
+    """
     connector, _ = make_connector(config)
 
-    assert connector._sql_string_literal("a'b") == "'a''b'"
+    assert connector._sql_string_literal("a'b") == "'a\\'b'"
+    assert connector._sql_string_literal("a\\b") == "'a\\\\b'"
 
 
 def test_sample_partition_predicate_prefers_partition_with_data(config):

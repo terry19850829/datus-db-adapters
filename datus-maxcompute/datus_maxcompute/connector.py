@@ -120,17 +120,19 @@ def _coerce_config(config: Union[MaxComputeConfig, Dict[str, Any], BaseModel]) -
     )
 
 
-def _declares_partitions(table: Any) -> bool:
-    """Whether *table* declares partition columns.
+def _declares_partitions(table: Any) -> Optional[bool]:
+    """Whether *table* declares partition columns, or ``None`` when that is unknown.
 
-    Wrapped in a helper because the metadata read itself can fail on odd table
-    types; a table whose schema cannot be inspected is treated as unpartitioned,
-    which keeps the caller on the predicate-free path it has always used.
+    Wrapped in a helper because the metadata read itself can fail on odd table types --
+    foreign tables in particular. A failed read is reported as ``None`` rather than
+    ``False``: it does not prove the table is unpartitioned, and assuming it is sends
+    the caller down the predicate-free path that ``odps.sql.allow.fullscan=false``
+    rejects, burning a job for a sample it never produces.
     """
     try:
         return bool(getattr(table.table_schema, "partitions", None))
-    except Exception:  # noqa: BLE001 - unreadable schema: assume no partitions
-        return False
+    except Exception:  # noqa: BLE001 - unreadable schema: partition state unknown
+        return None
 
 
 def _matches_ignore_patterns(name: str, patterns: Sequence[str]) -> bool:
@@ -827,14 +829,19 @@ class MaxComputeConnector(BaseSqlConnector):
         MaxCompute allows reserved words as partition-column names.
 
         Returns:
-            ``""`` for unpartitioned tables -- no predicate required.
+            ``""`` for tables that definitively declare no partitions -- no predicate
+            required.
             ``" WHERE ..."`` when a partition could be pinned.
-            ``None`` when the table *is* partitioned but no partition could be
-            resolved. The caller must skip such a table: an unqualified ``SELECT *``
-            is guaranteed to be rejected, so running it only burns a job and logs a
-            traceback for a failure that is already known.
+            ``None`` when the table may be partitioned but no partition could be
+            resolved, including when its schema could not be read at all. The caller
+            must skip such a table: an unqualified ``SELECT *`` would be rejected, so
+            running it only burns a job and logs a traceback for a failure that is
+            already known.
         """
-        if not _declares_partitions(table):
+        declares_partitions = _declares_partitions(table)
+        if declares_partitions is None:
+            return None
+        if not declares_partitions:
             return ""
 
         partition = self._max_partition(table)

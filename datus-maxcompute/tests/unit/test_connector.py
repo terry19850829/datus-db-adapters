@@ -54,6 +54,19 @@ def make_instance(table=None):
     return instance, reader
 
 
+def make_unpartitioned_table(name, table_type="MANAGED_TABLE"):
+    """A listed table that explicitly declares no partitions.
+
+    ``table_schema`` has to be there: without it the connector cannot tell
+    "not partitioned" from "metadata unreadable" and skips the table entirely.
+    """
+    return SimpleNamespace(
+        name=name,
+        type=SimpleNamespace(value=table_type),
+        table_schema=SimpleNamespace(partitions=None),
+    )
+
+
 def test_execute_query_logs_original_exception(config, caplog):
     connector, _ = make_connector(config)
     error = RuntimeError("query failed")
@@ -503,8 +516,8 @@ def test_tables_are_all_listed_when_no_pattern_configured(config):
 def test_get_sample_rows_routes_implicit_view_requests(config):
     connector, odps = make_connector(config)
     odps.list_tables.return_value = [
-        SimpleNamespace(name="orders", type=SimpleNamespace(value="MANAGED_TABLE")),
-        SimpleNamespace(name="orders_view", type=SimpleNamespace(value="VIRTUAL_VIEW")),
+        make_unpartitioned_table("orders"),
+        make_unpartitioned_table("orders_view", "VIRTUAL_VIEW"),
     ]
     query_result = SimpleNamespace(
         success=True,
@@ -528,9 +541,9 @@ def test_get_sample_rows_routes_implicit_view_requests(config):
 def test_get_sample_rows_full_preserves_actual_object_types(config):
     connector, odps = make_connector(config)
     odps.list_tables.return_value = [
-        SimpleNamespace(name="orders", type=SimpleNamespace(value="MANAGED_TABLE")),
-        SimpleNamespace(name="orders_view", type=SimpleNamespace(value="VIRTUAL_VIEW")),
-        SimpleNamespace(name="orders_mv", type=SimpleNamespace(value="MATERIALIZED_VIEW")),
+        make_unpartitioned_table("orders"),
+        make_unpartitioned_table("orders_view", "VIRTUAL_VIEW"),
+        make_unpartitioned_table("orders_mv", "MATERIALIZED_VIEW"),
     ]
     query_result = SimpleNamespace(
         success=True,
@@ -551,10 +564,7 @@ def test_get_sample_rows_full_preserves_actual_object_types(config):
 @pytest.mark.parametrize("table_type", ["full", "view"])
 def test_get_sample_rows_resolves_explicit_object_type(config, table_type):
     connector, odps = make_connector(config)
-    odps.get_table.return_value = SimpleNamespace(
-        name="orders_view",
-        type=SimpleNamespace(value="VIRTUAL_VIEW"),
-    )
+    odps.get_table.return_value = make_unpartitioned_table("orders_view", "VIRTUAL_VIEW")
     query_result = SimpleNamespace(
         success=True,
         sql_return=pd.DataFrame({"id": [1]}),
@@ -712,23 +722,23 @@ def test_get_sample_rows_omits_predicate_for_unpartitioned_table(config):
     )
 
 
-def test_get_sample_rows_falls_back_when_partition_metadata_is_missing(config):
+def test_get_sample_rows_skips_table_with_unreadable_metadata(config):
+    """读不出 schema 的表不猜分区状态，也不发无谓词查询。
+
+    把它当成"非分区表"会退回本 PR 要消除的那条无谓词查询；若该表其实是分区表，
+    查询必被 ODPS-0130071 拒绝 —— 样本一样拿不到，还白烧一个作业。
+    """
     connector, odps = make_connector(config)
     # A table object without a table_schema stands in for metadata the driver cannot read.
     odps.list_tables.return_value = [
         SimpleNamespace(name="orders", type=SimpleNamespace(value="MANAGED_TABLE")),
     ]
-    query_result = SimpleNamespace(success=True, sql_return=pd.DataFrame({"id": [1]}), error=None)
 
-    with patch.object(connector, "execute_query", return_value=query_result) as execute_query:
-        connector.get_sample_rows(top_n=2)
+    with patch.object(connector, "execute_query") as execute_query:
+        result = connector.get_sample_rows(top_n=2)
 
-    execute_query.assert_called_once_with(
-        "SELECT * FROM `project_a`.`default`.`orders` LIMIT 2",
-        result_format="pandas",
-        database_name="project_a",
-        schema_name="default",
-    )
+    assert result == []
+    execute_query.assert_not_called()
 
 
 def test_sql_string_literal_escapes_single_quotes(config):
@@ -833,8 +843,21 @@ def test_sample_partition_predicate_quotes_reserved_partition_key(config):
     assert connector._sample_partition_predicate(table) == " WHERE `select`='20260911'"
 
 
-def test_declares_partitions_treats_unreadable_schema_as_unpartitioned():
-    """schema 读失败的表按非分区表处理，退回既有的无谓词路径。"""
+def test_declares_partitions_reports_unknown_when_schema_is_unreadable():
+    """schema 读失败 ≠ 非分区表：返回 None，由调用方跳过该表。
+
+    当成非分区表的话，调用方会发无谓词查询；该表其实可能是分区表，在
+    ``odps.sql.allow.fullscan=false`` 下必被 ODPS-0130071 拒绝 —— 白烧一个作业，
+    而样本同样拿不到。
+    """
     table_without_schema = SimpleNamespace()
 
-    assert _declares_partitions(table_without_schema) is False
+    assert _declares_partitions(table_without_schema) is None
+
+
+def test_sample_partition_predicate_skips_table_with_unreadable_schema(config):
+    """schema 读不出的表不猜分区状态，直接返回 None 交给调用方跳过。"""
+    connector, _ = make_connector(config)
+    table = SimpleNamespace(name="orders")
+
+    assert connector._sample_partition_predicate(table) is None
